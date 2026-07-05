@@ -151,18 +151,38 @@ pub struct OwnedUmem<T: DerefMut<Target = [u8]>> {
     frame_size: u32,
     available_frames: Vec<u64>,
     capacity: usize,
+    headroom: usize,
 }
 
 impl<T: DerefMut<Target = [u8]>> OwnedUmem<T> {
     pub fn new(owned: T, frame_size: u32) -> Result<Self, io::Error> {
+        Self::new_with_headroom(owned, frame_size, 0)
+    }
+
+    pub fn new_with_headroom(
+        owned: T,
+        frame_size: u32,
+        headroom: usize,
+    ) -> Result<Self, io::Error> {
         debug_assert!(frame_size.is_power_of_two());
+        debug_assert!(headroom < frame_size as usize);
         let capacity = owned.len() / frame_size as usize;
         Ok(Self {
             owned,
             frame_size,
             available_frames: Vec::from_iter(0..capacity as u64),
             capacity,
+            headroom,
         })
+    }
+
+    pub fn headroom(&self) -> usize {
+        self.headroom
+    }
+
+    pub fn frame_headroom_mut(&mut self, frame: &OwnedUmemFrame) -> &mut [u8] {
+        let start = frame.offset.saturating_sub(self.headroom);
+        unsafe { slice::from_raw_parts_mut(self.owned.as_mut_ptr().add(start), self.headroom) }
     }
 }
 
@@ -189,7 +209,7 @@ impl<T: DerefMut<Target = [u8]>> Umem for OwnedUmem<T> {
         let index = self.available_frames.pop()?;
 
         Some(OwnedUmemFrame {
-            offset: index as usize * self.frame_size as usize,
+            offset: index as usize * self.frame_size as usize + self.headroom,
             len: 0,
         })
     }

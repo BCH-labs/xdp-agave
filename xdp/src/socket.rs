@@ -1,4 +1,3 @@
-use libc::{SOL_SOCKET, SO_BUSY_POLL, SO_BUSY_POLL_BUDGET, SO_PREFER_BUSY_POLL};
 use {
     crate::{
         device::{
@@ -9,9 +8,10 @@ use {
     },
     libc::{
         bind, getsockopt, sa_family_t, sendto, setsockopt, sockaddr, sockaddr_xdp, socket,
-        socklen_t, xdp_mmap_offsets, xdp_umem_reg, AF_XDP, SOCK_RAW, SOL_XDP, XDP_COPY,
-        XDP_MMAP_OFFSETS, XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RING_NEED_WAKEUP, XDP_RX_RING,
-        XDP_TX_RING, XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING,
+        socklen_t, xdp_mmap_offsets, xdp_umem_reg, AF_XDP, SOCK_RAW, SOL_SOCKET, SOL_XDP,
+        SO_BUSY_POLL, SO_BUSY_POLL_BUDGET, SO_PREFER_BUSY_POLL, XDP_COPY, XDP_MMAP_OFFSETS,
+        XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RING_NEED_WAKEUP, XDP_RX_RING, XDP_TX_RING,
+        XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING,
         XDP_UMEM_PGOFF_FILL_RING, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
     },
     std::{
@@ -24,6 +24,21 @@ use {
     },
 };
 
+pub const XDP_UMEM_TX_METADATA_LEN: u32 = 1 << 2;
+pub const XDP_TX_METADATA: u32 = 1 << 1;
+pub const XDP_TXMD_FLAGS_TIMESTAMP: u64 = 1 << 0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct XskTxMetadata {
+    pub flags: u64,
+    pub tx_timestamp: u64,
+}
+
+impl XskTxMetadata {
+    pub const LEN: usize = core::mem::size_of::<XskTxMetadata>();
+}
+
 pub struct Socket<U: Umem> {
     fd: OwnedFd,
     dev_queue: DeviceQueue,
@@ -32,6 +47,7 @@ pub struct Socket<U: Umem> {
 
 impl<U: Umem> Socket<U> {
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dev_queue: DeviceQueue,
         mut umem: U,
@@ -40,6 +56,8 @@ impl<U: Umem> Socket<U> {
         rx_ring_size: usize,
         tx_completion_ring_size: usize,
         tx_ring_size: usize,
+        rx_headroom: u32,
+        tx_metadata_len: u32,
     ) -> Result<(Self, Rx<U::Frame>, Tx<U::Frame>), io::Error> {
         unsafe {
             let fd = socket(AF_XDP, SOCK_RAW, 0);
@@ -52,9 +70,13 @@ impl<U: Umem> Socket<U> {
                 addr: umem.as_ptr() as u64,
                 len: umem.len() as u64,
                 chunk_size: umem.frame_size() as u32,
-                headroom: 0,
-                flags: 0,
-                tx_metadata_len: 0,
+                headroom: rx_headroom,
+                flags: if tx_metadata_len > 0 {
+                    XDP_UMEM_TX_METADATA_LEN
+                } else {
+                    0
+                },
+                tx_metadata_len,
             };
 
             if setsockopt(
@@ -260,6 +282,17 @@ impl<U: Umem> Socket<U> {
         completion_size: usize,
         ring_size: usize,
     ) -> Result<(Self, Tx<U::Frame>), io::Error> {
+        Self::tx_with_metadata(queue, umem, zero_copy, completion_size, ring_size, 0)
+    }
+
+    pub fn tx_with_metadata(
+        queue: DeviceQueue,
+        umem: U,
+        zero_copy: bool,
+        completion_size: usize,
+        ring_size: usize,
+        tx_metadata_len: u32,
+    ) -> Result<(Self, Tx<U::Frame>), io::Error> {
         let (fill_size, rx_size) = if zero_copy {
             // See Socket::new() as to why this is needed
             let rx = queue
@@ -279,6 +312,8 @@ impl<U: Umem> Socket<U> {
             rx_size,
             completion_size,
             ring_size,
+            0,
+            tx_metadata_len,
         )?;
         Ok((socket, tx))
     }
@@ -290,7 +325,28 @@ impl<U: Umem> Socket<U> {
         fill_size: usize,
         ring_size: usize,
     ) -> Result<(Self, Rx<U::Frame>), io::Error> {
-        let (socket, rx, _) = Self::new(queue, umem, zero_copy, fill_size, ring_size, 1, 0)?;
+        Self::rx_with_headroom(queue, umem, zero_copy, fill_size, ring_size, 0)
+    }
+
+    pub fn rx_with_headroom(
+        queue: DeviceQueue,
+        umem: U,
+        zero_copy: bool,
+        fill_size: usize,
+        ring_size: usize,
+        rx_headroom: u32,
+    ) -> Result<(Self, Rx<U::Frame>), io::Error> {
+        let (socket, rx, _) = Self::new(
+            queue,
+            umem,
+            zero_copy,
+            fill_size,
+            ring_size,
+            1,
+            0,
+            rx_headroom,
+            0,
+        )?;
         Ok((socket, rx))
     }
 
